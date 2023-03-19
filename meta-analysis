@@ -1,0 +1,289 @@
+library(VennDiagram)
+library(ggplot2)
+library(limma)
+library(sva)
+library(Biobase)
+library(RUVnormalize)
+library(magrittr)
+library(plotly)
+library(WriteXLS)
+library(gplots)
+library(RColorBrewer)
+library(pheatmap)
+library(reshape2)
+
+#base configs
+options(stringsAsFactors = FALSE)
+colors=c("#88d86c","#ee3c3c")
+wd = "c:\\users\\hassan\\desktop\\s\\"
+setwd(paste0(wd))
+
+#configs
+data_set = 3; # 1 for Lung, 2 for PMBC, 3 for Skin
+merge_ids = c(1, 2 ,3)
+if (data_set == 3)
+  merge_ids = c(merge_ids, 4)
+alg_type = 2 # 1 for RUV and 2 for Combat
+
+#L	GSE81292	GPL570-55999    [HG-U133A_2] Affymetrix Human Genome U133A 2.0 Array [HGU133A2_Hs_ENTREZG_16.0.0]
+#L	GSE48149	GPL16221-11373  Illumina HumanRef-8 v3.0 expression beadchip (Search Key version)
+#L	GSE76808	GPL571-17391    [HG-U133A_2] Affymetrix Human Genome U133A 2.0 Array
+#L	GSE40839	GPL96-57554     [HG-U133A] Affymetrix Human Genome U133A Array
+#P	GSE19617	GPL6480-9577    Agilent-014850 Whole Human Genome Microarray 4x44K G4112F (Probe Name version)
+#P	GSE22356	GPL570-55999    [HG-U133_Plus_2] Affymetrix Human Genome U133 Plus 2.0 Array
+#P	GSE33463	GPL6947-13512   Illumina HumanHT-12 V3.0 expression beadchip
+#S	GSE32413	GPL4133_old_annotations
+#S	GSE45485	GPL6480-9577
+#S	GSE9285   GPL5981
+#S	GSE76807  GPL6480 Agilent-014850 Whole Human Genome Microarray 4x44K G4112F
+
+
+data_set_name = c("Lung", "PBMC", "Skin")[data_set]
+ds.id <- list(c("81292", "48149", "76808"),
+              c("19617", "22356", "33463"),
+              c("32413", "45485", "9285", "76807"))[[data_set]]
+ds.plat <- list(c("18991", "16221-11373", "571-17391"),
+                c("6480-9577", "570-55999", "6947-13512"),
+                c("4133_old_annotations", "6480-9577", "5981", "6480-9577"))[[data_set]]
+annot_columns = list(list(c("Gene.ID", "Gene.Symbol"), c("Entrez_Gene_ID", "Symbol"), c("ENTREZ_GENE_ID", "Gene.Symbol")),
+                     list(c("GENE", "GENE_SYMBOL"), c("ENTREZ_GENE_ID", "Gene.Symbol"), c("Entrez_Gene_ID", "Symbol")),
+                     list(c("GENE", "GENE_SYMBOL"), c("GENE", "GENE_SYMBOL"), c("ENTREZ", "SYMBOL"), c("GENE", "GENE_SYMBOL")))[[data_set]]
+
+#reading data
+data.files <- paste0("data/GSE", ds.id, "_series_matrix.txt")
+raw <- lapply(data.files, read.delim, comment.char = "!", na.strings = "null")
+raw <- lapply(raw, function(x) {
+  rownames(x) <- x[, 1]
+  x[, -1]
+})
+data <-
+  lapply(raw, function(x)
+    if (max(x, na.rm = TRUE) > 100)
+      log2(x + 1)
+    else
+      x)
+
+## Agilent dataset multiply by -1
+if (data_set == 3) {data = lapply(seq_along(data), function(i) data[[i]] * -1)}
+
+if (data_set == 2) {data[[1]] = data[[1]] * -1}
+
+#deleting the unwanted samples from the data
+sample.infos.files = paste0("data/GSE", ds.id, ".txt")
+sample.infos = lapply(sample.infos.files, read.delim, comment.char = "", header = FALSE)
+sample.infos = lapply(sample.infos, function(sample.info) {
+  sample.info = t(as.data.frame(sample.info))
+  colnames(sample.info) <- sample.info[1, ]
+  sample.info = sample.info[-1, ]
+  rownames(sample.info) = c("sample_type", "sample_index")
+  sample.info["sample_index", ] = as.integer(sample.info["sample_index", ])
+  sample.info
+})
+
+replicates = lapply(sample.infos, function(sample.info) {sample.info["sample_index",]})
+sample.infos = lapply(sample.infos, function(sample.info) {sample.info["sample_index",][duplicated(sample.info["sample_index",])] = -1; sample.info})
+
+data <-
+  lapply(seq_along(data), function(i) {
+    repl = replicates[[i]]
+    te = unique(repl[duplicated(repl)])
+    for (j in te) {
+      rep_ids = which(repl %in% j)
+      data[[i]][,rep_ids[1]] = rowMeans(data[[i]][,rep_ids])
+    }
+    data[[i]][which(sample.infos[[i]]["sample_index", ] != -1)]
+  })
+
+sample.infos <-
+  lapply(sample.infos, function(sample.info) {
+    x = data.frame(sample.info)
+    x = x[which(sample.info["sample_index", ] != -1)][1, ]
+    #    x[1,][x[2,]==1]="Del"
+    #    x = x[1,]
+    x[x!="Healthy" & x != "Del"] = "SSc"
+    x
+  })
+
+plat.files <- paste0("annotation/GPL", ds.plat, ".txt")
+annot0 = lapply(plat.files, read.delim, comment.char = "#", quote = "")
+if (data_set == 3) {
+  agi_id = read.delim(paste0("annotation/GPL", ds.plat[[3]], "_ID.txt"))
+  annot0[[3]] = merge(annot0[[3]], agi_id, by="ID")
+  # colnames(annot0[[4]]) = c("ID", "X10")
+}
+annot = lapply(seq_along(annot0), function(i) {
+  ann = annot0[[i]][!grepl("///", unlist(annot0[[i]][annot_columns[[i]][1]])),c("ID", annot_columns[[i]][1], annot_columns[[i]][2])]
+  colnames(ann) = c("ID", "ENTREZ", "SYMBOL")
+  ann = ann[ann$ENTREZ != "",]
+  ann
+})
+
+#merging platform and data
+categoryNamesForDiagram = paste0(rep("GSE", length(merge_ids)), paste(ds.id))
+colorsForDiagram = c("yellow", "red", "green")
+if (data_set == 3)
+  colorsForDiagram = c(colorsForDiagram, "blue")
+futile.logger::flog.threshold(futile.logger::ERROR, name = "VennDiagramLogger")
+entrezList <- lapply(annot, function(ann) unique(ann$ENTREZ))
+venn.diagram(entrezList, category.names = categoryNamesForDiagram, filename = paste0("results/", data_set_name, "_venn_ENTREZ.jpg"), cat.cex = 0.8, lwd = 0, height = 1500, width = 3000, na = "remove", fill = colorsForDiagram)
+
+symbolList <- lapply(annot, function(ann) unique(ann$SYMBOL))
+venn.diagram(symbolList, category.names = categoryNamesForDiagram, filename = paste0("results/", data_set_name, "_venn_SYMBOL.jpg"), cat.cex = 0.8, lwd = 0, height = 1500, width = 3000, na = "remove", fill = colorsForDiagram)
+
+merged_data <- lapply(seq_along(data), function(i) merge(annot[[i]], data[[i]], by.x = "ID", by.y="row.names"))
+merged_data <- lapply(merged_data, function(m) m[c(-3,-1)])
+
+sample_states <- sample.infos[[1]]
+for (i in 2:length(merged_data)) {
+  sample_states <- cbind(sample_states, sample.infos[[i]])
+}
+#lapply(seq_along(merged_data), function(i) data.frame(ID = rownames(merged_data[[i]]), state = rownames(sample.infos[[i]])))
+
+aggregated_data <- lapply(merged_data, function(x) aggregate(. ~ ENTREZ, x, mean))
+aggregated_data <-
+  lapply(aggregated_data, function(x) {
+    rownames(x) <- x[, 1]
+    x[, -1]
+  })
+
+aggregated_data = lapply(aggregated_data, normalizeQuantiles) # didn't work well on first data
+pdf(paste0("results/", data_set_name, "_pca.pdf"), onefile = T)
+for (i in 1:length(aggregated_data)) {
+  pcr1 = data.frame(prcomp(aggregated_data[[i]])$r[, 1:3])
+  cell_status = factor(t(sample.infos[[i]]))
+  print(ggplot(pcr1, aes(PC1, PC2, color = cell_status)) + geom_point(size = 5) + theme_bw())
+  #print(pcr1)
+  #print(c(cell_status))
+}
+dev.off()
+
+
+# merge datas
+batchs = Reduce(function(x, y) c(x, y), lapply(merge_ids, function(id) rep(id, length(sample.infos[[id]]))))
+gr <- data.frame(Reduce(function(...) c(...), sample.infos[merge_ids]))
+gr = factor(t(gr))
+
+mdata <- data.frame(Reduce(function(...) {temp = merge(..., by = "row.names"); row.names(temp) = temp[,1]; temp[, -1]}, aggregated_data[merge_ids]))
+#dim(mdata);lapply(aggregated_data[merge_ids], dim)
+#
+
+dataset=factor(rep(batchs, each=dim(mdata)[1]))
+pdf(paste0(wd, "results/bxplot_", data_set_name, "_before.pdf"), width=1 + 0.16 * dim(mdata)[2])
+ggplot(melt(mdata,id.vars = 0),aes(x=variable, y=value, fill=dataset))+geom_boxplot()+theme_bw()+theme(axis.text.x = element_text(angle = 90), panel.grid.major = element_blank(), panel.grid.minor = element_blank())+labs(x="Samples", y="Expression value")
+dev.off()
+
+
+pdf(paste0(wd, "results/heat$box.pdf"))
+Palette <- colorRampPalette(c("green", "black", "red"))(n = 1000)
+pheatmap(mdatac_var, fontsize_row=0.7, fontsize_col=4, border_color=NA,labels_row=rownames(mdatac_var), labels_col=samples,color=Palette,ylab="ENTREZ", xlab="Samples")
+dev.off()
+
+
+#RUV normalize pre work
+mdata_center <- scale(t(mdata), scale=FALSE) # Center gene expressions
+NC <- read.delim("data/Housekeeping_genes.txt", sep="\t")
+cIdx <- which(colnames(mdata_center) %in% NC$ENTREZ)
+
+if (alg_type == 1) {
+  clean_mdata = as.data.frame(t(naiveRandRUV(mdata_center, cIdx, k=length(merge_ids)))) #RUV normalize
+} else {
+  clean_mdata = ComBat(as.matrix(mdata), batchs) #Combat normalize
+}
+
+pdf(paste0(wd, "results/bxplot_", data_set_name, "_after.pdf"), width=1 + 0.16 * dim(mdata)[2])
+ggplot(melt(clean_mdata,id.vars = 0),aes(x=Var2, y=value, fill=dataset))+geom_boxplot()+
+  theme_bw()+theme(axis.text.x = element_text(angle = 90), panel.grid.major = element_blank(), panel.grid.minor = element_blank())+
+  labs(x="Samples", y="Expression value")+scale_fill_discrete(labels = paste0("GSE", ds.id))
+dev.off()
+
+
+pcr_mean = data.frame(prcomp(clean_mdata - rowMeans(clean_mdata))$r[, 1:3])
+
+plot_ly(pcr_mean, x = pcr_mean$PC1, y = pcr_mean$PC2, z = pcr_mean$PC3, color = gr, colors=colors)%>%add_markers()%>%
+  layout(title="3D PCA_mean",scene = list(xaxis = list(title = "PC1"), yaxis = list(title = "PC2"), zaxis = list(title = "PC3")))
+
+# RLE plot
+pcr_median = data.frame (prcomp(clean_mdata - apply(clean_mdata, 1, median))$r[, 1:3])
+
+plot_ly(pcr_median, x = pcr_median$PC1, y = pcr_median$PC2, z = pcr_median$PC3, color = gr, colors=colors)%>%add_markers()%>%
+  layout(title="3D RLE_Plot",scene = list(xaxis = list(title = "PC1"), yaxis = list(title = "PC2"), zaxis = list(title = "PC3")))
+
+
+design <- model.matrix(~ gr+0, as.data.frame(clean_mdata))
+fit <- lmFit(clean_mdata, design)
+cont.matrix <- makeContrasts(grSSc-grHealthy, levels=design)
+cont_fit <- eBayes(contrasts.fit(fit, cont.matrix)) # TODO: , 0.01
+# # to get whole tT
+# tT0 <- topTable(cont_fit, number = Inf)
+# annot_u = lapply(annot, function(ann){
+#   ann[!duplicated(ann$ENTREZ),]
+# })
+# tT1 = merge(tT0, annot_u[[merge_ids[1]]], by.x="row.names", by.y = "ENTREZ")
+# rownames(tT1) = tT1$Row.names
+# tT <- subset(tT1, select=c("SYMBOL", "adj.P.Val","logFC") )
+# write.table(tT, file = "skin_tT.txt", sep = "\t", quote = F)
+
+tT0 <- topTable(cont_fit, adjust="fdr", sort.by="B", number = 10000, p.value = 0.05, lfc = 0.5)
+
+annot_u = lapply(annot, function(ann){
+  ann[!duplicated(ann$ENTREZ),]
+})
+tT1 = merge(tT0, annot_u[[merge_ids[1]]], by.x="row.names", by.y = "ENTREZ")
+rownames(tT1) = tT1$Row.names
+
+tT <- subset(tT1, select=c("SYMBOL", "adj.P.Val","logFC"))
+write.table(tT, file=paste0("results/", data_set_name, "_deg.rnk"), row.names=T, sep="\t", col.names = F, quote = F)
+
+#=========================================================================================
+# Heatmap on DEGs
+#=========================================================================================
+  
+Palette <- colorRampPalette(c("green", "black", "red"))(n = 1000)
+
+DEG <- subset(clean_mdata, rownames(clean_mdata)%in%rownames(tT))
+pdf ("heatmap.pdf", height = 10)
+heatmap.2(as.matrix(tT), Colv = FALSE, trace = "none", dendrogram = "row",
+          cexRow = 0.08, cexCol = 0.6, srtRow = 90,col = Palette, labRow=tT$SYMBOL,
+          ylab = "Differentially Expressed Genes", xlab = "Samples")
+dev.off()
+
+# Second-way
+pdf("pheatmap.pdf")
+pheatmap(unique_exprs, fontsize_row = 0.7, fontsize_col = 4, border_color = NA,
+         labels_row = gSYMBOLS$SYMBOLS, color = Palette, 
+         ylab = "Differentially Expressed Genes", xlab = "Samples")
+dev.off()
+# tT <- data.frame(entrezID = rownames(tT), SYMBOL = tT$SYMBOL, adj.P.Val = tT$adj.P.Val, logFC = tT$logFC)
+# upRegulated <- tT[which(tT$logFC>=0.6),]
+# downRegulated <- tT[which(tT$logFC<=-0.6),]
+# tTName <- paste0(paste0(c("Lung", "PBMC", "Skin")[data_set], paste(as.character(merge_ids), collapse = ",")), c("RUV", "ComBat")[alg_type])
+# WriteXLS(list(upRegulated, downRegulated), ExcelFileName = paste0(paste0("results/", tTName),".XLS"), SheetNames = c("up regulated", "down regulated"))
+
+############################################## Share DEGs
+
+setwd(paste0(wd, "results"))
+DEGs <- list("Lung_DEGs.txt","PBMC_DEGs.txt","skin_DEGs.txt")
+DG <- lapply(DEGs, read.delim, quote = "")
+
+sh_12 <- merge(DG[[1]], DG[[2]], by = "ENTREZ")
+write.table(sh_12[,-5], "sh_12.txt",row.names = F, sep="\t")
+sh_13 <- merge(DG[[1]], DG[[3]], by = "ENTREZ")
+write.table(sh_13[,-5], "sh_13.txt",row.names = F, sep="\t")
+sh_23 <- merge(DG[[2]], DG[[3]], by = "ENTREZ")
+write.table(sh_23[,-5], "sh_23.txt",row.names = F, sep="\t")
+
+####################### generating file for GSEA
+f.name = paste0("data/GSEA_dataset_", data_set, ".cls")
+levs = unique(as.character(gr))
+write(c(length(gr), length(levs), 1), f.name)
+write(c("#", levs), f.name, append=TRUE, ncolumns = 10)
+write(as.character(gr), f.name, sep=" ", append=TRUE, ncolumns = length(gr))
+
+clean_mdata1 = as.data.frame(clean_mdata)
+clean_mdata1 = cbind(NAME = row.names(clean_mdata1), DESCRIPTION = "NA", clean_mdata1)
+write.table(clean_mdata1, paste0("data/GSEA_dataset_", data_set, ".txt"), row.names = F, sep = "\t", quote = F)
+
+chip = annot_u[[merge_ids[1]]][,c("ENTREZ", "SYMBOL", "SYMBOL")]
+colnames(chip) = c("Probe Set ID", "Gene Symbol", "Gene Title")
+chip = chip[complete.cases(chip),]
+write.table(chip, paste0("data/GSEA_dataset_", data_set, ".chip"), row.names = F, sep = "\t", quote = F)
